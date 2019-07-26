@@ -1,0 +1,461 @@
+---
+title: "Municipal Information"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(flexdashboard)
+library(ggplot2)
+library(tidyverse)
+library(stringr)
+library(RSQLite)
+library(DBI)
+library(gridExtra)
+library(ggthemes)
+library(scales)
+library(kableExtra)
+library(tables)
+library(rvest)
+library(RCurl)
+library(XML)
+library(scrapeR)
+library(magrittr)
+library(tableHTML)
+library(RColorBrewer)
+```
+
+
+Column {data-width=250}
+-----------------------------------------------------------------------
+```{r}
+#In future, webapp versions, Community will be selected by dropdown. Here, must be specified
+CommunityArg <- 'Hanover'
+
+# Creating a more attractive text object in html for the town name.
+#tableHTML allows for css-styled html tables.
+CommunityArg <- as.matrix(CommunityArg)
+tableHTML(CommunityArg,theme="rshiny-blue") %>%
+  add_css_table(css=list('width','100%')) %>%
+  add_css_table(css=list('background-color','white')) %>%
+  add_css_table(css=list('text-align','left')) %>%
+  add_css_table(css=list('color','03487b')) %>%
+  add_css_table(css=list('font-size','28')) %>%
+  add_css_column(css=list('color','white'),columns=c(0))%>%
+  add_css_header(css=list(c('color','background-color'),c('white','white')),headers=c(1:4))
+```
+
+
+### Age Demographics (blue bars = statewide)
+```{r}
+#Setting the working directory to where the SQLite database is stored
+setwd("G:/Programs & Policy/DATA/Community Profiles/R files")
+db <- dbConnect(SQLite(),dbname="CensusDB.sqlite")
+
+#Query of statewide data for comparison purposes
+
+sql15 <- str_replace_all(
+  str_replace_all(
+    str_replace_all(
+      paste("
+        SELECT Community.Community, AgeDemogs.AgeGroup, AgeDemogs.Count
+        FROM Community LEFT JOIN AgeDemogs on Community.GEO_ID = AgeDemogs.GEO_ID
+        "),
+      "\n",""),
+    "' ","'"),
+  " '","'")
+
+#pulling the data from the database based on specified SQL statement
+q15 <-
+dbGetQuery(db,sql15)
+
+#summarising statewide data by share of total in each age cohort
+q16 <- q15 %>% select(Community,AgeGroup,Count) %>%
+  group_by(AgeGroup) %>%
+  summarise(StateTotal = sum(Count))%>%
+  mutate(StateShare=StateTotal/sum(StateTotal))
+
+
+#Query Age Data for just the selected community
+#in order to parameterize the SQL statement, I've used a paste technique to pull in the specified community
+sql3 <- str_replace_all(
+  str_replace_all(
+    str_replace_all(
+      paste("
+        SELECT AgeDemogs.AgeGroup, AgeDemogs.Count, AgeDemogs.Share
+        FROM Community LEFT JOIN AgeDemogs on Community.GEO_ID = AgeDemogs.GEO_ID
+        WHERE Community.Community =
+        '",CommunityArg,"'"),
+      "\n",""),
+    "' ","'"),
+  " '","'")
+
+#pulling local data based on specificed SQL statement
+q3 <-
+dbGetQuery(db,sql3)
+
+#joining local data to state data as prep for comparison chart
+q20 <- left_join(q3,q16,by="AgeGroup")
+
+#plotting state and local data on same chart:
+ggplot(data = q20)+
+  geom_bar(stat="identity",aes(x=AgeGroup,y=StateShare),alpha=0.5,fill="deepskyblue")+     geom_bar(stat="identity",aes(x=AgeGroup,y=Share,fill="firebrick"),alpha=0.55)+
+  theme_bw()+
+  scale_x_discrete(labels=c("under 5", "5 to 9","10 to 14","15 to 19","20 to 24","25 to 29","30 to 34", "35 to 39","40 to 44","45 to 49","50 to 54","55 to 59","60 to 64","65 to 69","70 to 74","75 to 79","80 to 84","85 Plus"))+
+  theme(axis.text.x = element_text(angle=90,hjust=1,size=14),
+        legend.position = "none",
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title = element_blank()
+        )
+```
+
+### Racial composition
+```{r}
+#Query for race data for all communities in state
+sql17 <- str_replace_all(
+  str_replace_all(
+    str_replace_all(
+      paste("
+        SELECT Race.Race, Race.Count, Race.Year
+        FROM Community LEFT JOIN Race on Community.GEO_ID = Race.GEO_ID
+        "),
+      "\n",""),
+    "' ","'"),
+  " '","'")
+
+#retrieving data based on specified SQL statement
+q17 <-
+dbGetQuery(db,sql17)
+
+
+#summarising statewide data by share of total
+q18 <- q17 %>% select(Race,Count) %>%
+  group_by(Race) %>%
+  summarise(StateTotal = sum(Count))%>%
+  mutate(StateShare=StateTotal/sum(StateTotal))
+
+
+#Query for race data for selected community, parameterized by specified community
+sql4 <- str_replace_all(
+  str_replace_all(
+    str_replace_all(
+      paste("
+        SELECT Race.Race, Race.Count, Race.Year
+        FROM Community LEFT JOIN Race on Community.GEO_ID = Race.GEO_ID
+        WHERE Community.Community =
+        '",CommunityArg,"'"),
+      "\n",""),
+    "' ","'"),
+  " '","'")
+
+#retrieving from SQLite
+q4 <-
+dbGetQuery(db,sql4)
+
+#Creating factors based on size of each demographic
+q4$Race <- reorder(q4$Race,q4$Count)
+q4$Race <- factor(q4$Race, levels=rev(levels(q4$Race)))
+#creating a field that calculates proprtion by race
+q4$Share <- q4$Count/sum(q4$Count)
+
+#Joining the state and local data so they can be shown in same plot, then gathering to tidy prior to plotting
+q30 <- left_join(q4,q18,by= "Race")
+q30 <- q30 %>%  select(Year,Race,Share,StateShare)%>%
+  rename(Local=Share,State=StateShare)%>%
+  gather(Geography,Percent,Local:State)
+
+#plotting the state and local side by side using facets
+ggplot(data = q30, aes(x=Year,y=Percent,fill=Race,order=Race))+
+  geom_bar(stat="identity",color="gray30")+
+  theme(axis.text.y = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        legend.text = element_text(size=14),
+        axis.text = element_text(size=14),
+        strip.text = element_text(size=14,colour = "gray30"),
+        strip.background = element_rect(fill="white"),
+        legend.title = element_blank(),
+        legend.position = "top")+
+  scale_fill_brewer(palette="Set3")+
+  coord_flip()+
+  scale_y_continuous(labels=scales::percent)+
+  facet_wrap(~Geography,ncol = 1)
+```
+
+
+Column {data-width=300}
+-----------------------------------------------------------------------
+
+###Cost Burden
+```{r}
+
+#creating statements that will be used to parameterize the SQL commands:
+sql1 <- str_replace_all(
+  str_replace_all(
+    str_replace_all(
+      paste("
+        SELECT RentBurden.Tranch, RentBurden.Year, RentBurden.Count
+        FROM Community LEFT JOIN RentBurden on Community.GEO_ID = RentBurden.GEO_ID
+        WHERE Community.Community=
+        '",CommunityArg,"'"),
+      "\n",""),
+    "' ","'"),
+  " '","'")
+
+sql2 <- str_replace_all(
+  str_replace_all(
+    str_replace_all(
+      paste("
+        SELECT OwnerBurden.BurdenLevel, OwnerBurden.Year, OwnerBurden.Count
+        FROM Community LEFT JOIN OwnerBurden on Community.GEO_ID = OwnerBurden.GEO_ID
+        WHERE Community.Community =
+        '",CommunityArg,"'"),
+      "\n",""),
+    "' ","'"),
+  " '","'")
+
+#Running SQL statements:
+q1 <-
+dbGetQuery(db,sql1)
+q2 <- 
+  dbGetQuery(db,sql2)
+
+#Combining rental and ownership information into a single dataframe:
+BurdenTable <- data.frame(
+  'Burden Level' = c("Severely Burdened","Burdened","Not Burdened","Severely Burdened","Burdened","Not Burdened"),
+  'Tenure'= c('Renters','Renters','Renters','Owners','Owners','Owners'),
+  'Year' = q1$Year[1],
+  'Amount' = c( 
+      sum(q1$Count[q1$Tranch %in% c('Percent_50.0ormore')]),
+      sum(q1$Count[q1$Tranch %in%  
+        c('Percent_40.0to49.9','Percent_35to39.9','Percent_30to34.9')]),
+      sum(q1$Count[q1$Tranch %in% 
+        c('Percent_LessThan10','Percent_10to14.9','Percent_15to19.9','Percent_20to24.9','Percent_25to29.9')]),
+      sum(q2$Count[q2$BurdenLevel %in% c('Percent_50Plus')]),
+      sum(q2$Count[q2$BurdenLevel %in% 
+        c('Percent_40.0to49.9','Percent_35to39.9','Percent_30to34.9')]),
+      sum(q2$Count[q2$BurdenLevel %in% 
+        c('Percent_LessThan20','Percent_20to24.9','Percent_25to29.9')])))
+
+#Calculating percent of total separately for renters and owners
+BurdenTable$Share[1:3] = BurdenTable$Amount[1:3]/sum(BurdenTable$Amount[1:3])
+BurdenTable$Share[4:6] = BurdenTable$Amount[4:6]/sum(BurdenTable$Amount[4:6])
+
+#Creating factor levels for burden level so chart and table will be in the proper order
+BurdenTable$Burden.Level <- factor(BurdenTable$Burden.Level,levels=c("Not Burdened", "Burdened","Severely Burdened"),ordered = TRUE)
+
+#adding bar chart definition comparing burden by rent/own
+ggplot(BurdenTable)+
+  geom_col(aes(x=Tenure,y=Share,fill=Burden.Level))+
+  ylab("")+
+  scale_fill_brewer(palette="OrRd")+
+  theme_bw()+
+  theme(panel.border = element_blank(),
+        legend.title = element_blank(),
+        legend.position ="top",
+        axis.title.x = element_blank(),
+        axis.text = element_text(size=16),
+        legend.text = element_text(size=16))+
+  scale_y_continuous(labels= scales::percent)
+```
+
+###Cost Burden Table
+```{r, fig.height=2}
+#creating format for easier reporting
+t1 <- BurdenTable %>% select(Burden.Level,Tenure,Share) %>%
+  spread(Tenure,Share) %>%
+  rename("Burden Level" = Burden.Level)
+
+#going from decimal format to proper percentages
+t1$Owners <- paste0(format(t1$Owners*100,digits=0,drop0trailing = FALSE),'%')
+t1$Renters <- paste0(format(t1$Renters*100,digits=0,drop0trailing = FALSE),'%')
+
+#creating a formatted html table with css 
+tableHTML(t1,theme="rshiny-blue") %>%
+  add_css_table(css=list('width','100%')) %>%
+  add_css_table(css=list('background-color','white')) %>%
+  add_css_table(css=list('font-size','16')) %>%
+  add_css_column(css=list('color','white'),columns=c(0))%>%
+  add_css_header(css=list(c('color','background-color'),c('black','ffa500')),headers=c(1:4))
+
+```
+
+
+###Housing units by building type
+```{r}
+#SQL statement for building type, parameterized by selected community
+sql5 <- str_replace_all(
+  str_replace_all(
+    str_replace_all(
+      paste("
+        SELECT HousingUnits.Building_Type, HousingUnits.Count
+        FROM Community LEFT JOIN HousingUnits on Community.GEO_ID = HousingUnits.GEO_ID
+        WHERE Community.Community =
+        '",CommunityArg,"'"),
+      "\n",""),
+    "' ","'"),
+  " '","'")
+
+#pulling data from SQLite
+q5 <-
+dbGetQuery(db,sql5)
+
+#creating factor levels for the building type based loosely on density, then calculating share of total
+q5$Building_Type <- factor(q5$Building_Type,levels=c("Boat_RV_van_etc","Mobile_Home","Fifty_Plus_Units","Twenty_FortyNine_Units","Ten_Nineteen_Unit","Five_Nine_Unit","Three_Four_Fam","Two_Fam","SF_attached","SF_detached"))
+q5 <- q5 %>% mutate(Proportion = Count/sum(Count))
+
+#creating more easily understandable data labels for the chart
+buildingtypelabels <- c("Other","Mobile home","50+ Unit Building","20-49 Unit Building","10-19 Unit Building","5-9 Unit Building","3-4 Unit Building", "Two-Family","Single-family attached","Single-family detached")
+
+#simple bar chart showing share
+ggplot(data = q5)+
+  geom_col(aes(x=Building_Type,y=Proportion),fill="orangered")+
+  geom_text(aes(x=Building_Type,y=Proportion, label=paste0(format(100*Proportion,digits=1, drop0trailing = TRUE),'%')),hjust=-0.5)+
+  scale_x_discrete(labels = buildingtypelabels)+
+  scale_y_continuous(labels = scales::percent,limits=c(0,1))+
+  theme(axis.text.x = element_blank(),
+        axis.text.y = element_text(size=14),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        panel.background = element_blank())+
+  coord_flip()
+
+```
+
+
+Column {data-width=350}
+-----------------------------------------------------------------------
+
+### Market Data (from Trulia.com)
+```{r, fig.height=1, fig.width=2}
+#Unlike the other graphics, the data for this will be pulled live from trulia.com. The website has a summary market report by town, and I will parameterize the url to pull three pieces of information based on the selected community
+
+#Here is the base url, with %s used as a substitute for where the town name goes
+url <- "https://www.trulia.com/real_estate/%s-Massachusetts/"
+
+#using sprintf to replace the %s with the community specified at the top of the code
+url <- sprintf(url, CommunityArg)
+
+#reading the html
+page6 <- read_html(url)
+#parsing nodes
+pagetree6 <- htmlTreeParse(page6, useInternalNodes = TRUE)
+
+#The XPath for the desired information was identified using the 'View Source' option in Chrome, which allows users to copy the Xpath for a selected item. Then , using xpathApply to extract the information:
+variables <- unlist(xpathApply(pagetree6,"//*[contains(@class,'phm')]//*[contains(@class,'typeEmphasize')]/text()"),xmlValue)
+
+#The information was pulled in array format, so there is some clean up to do. First, pulling the data out into individual points:
+MedianPrice <- variables[[1]]
+PPsqFt <- variables[[2]]
+MedianRent <- variables[[3]]
+
+#in order to format as numeric, using stringr to replace the \n, commas, and dollar signs:
+MedianPrice <- str_replace_all(paste(capture.output(MedianPrice, file=NULL), collapse="\n"),"\\\n","")
+MedianPrice <- str_replace_all(MedianPrice," ","")
+MedianPrice <- str_replace_all(MedianPrice,"\\$","")
+MedianPrice <- as.numeric(str_replace_all(MedianPrice,",",""))
+
+PPsqFt <- str_replace_all(paste(capture.output(PPsqFt, file=NULL), collapse="\n"),"\\\n","")
+PPsqFt <- str_replace_all(PPsqFt," ","")
+PPsqFt <- str_replace_all(PPsqFt,"\\$","")
+PPsqFt <- as.numeric(str_replace_all(PPsqFt,",",""))
+
+MedianRent <- str_replace_all(paste(capture.output(MedianRent, file=NULL), collapse="\n"),"\\\n","")
+MedianRent <- str_replace_all(MedianRent," ","")
+MedianRent <- str_replace_all(MedianRent,"\\$","")
+MedianRent <- as.numeric(str_replace_all(MedianRent,",",""))
+
+#combining the cleaned values into a dataframe for display
+t2 <- cbind(
+  c("Median Price", "Price per sq ft", "Median Rent"),
+  c(
+    paste0('$', formatC(as.numeric(MedianPrice), format="f", digits=0, big.mark=",")),
+    paste0('$', formatC(as.numeric(PPsqFt), format="f", digits=0, big.mark=",")),
+    paste0('$', formatC(as.numeric(MedianRent), format="f", digits=0, big.mark=","))
+  ))
+
+t2 <- as.data.frame(t2)
+
+#creating a formatted html table with css
+tableHTML(t2,theme="rshiny-blue") %>%
+  add_css_table(css=list('width','100%')) %>%
+  add_css_table(css=list('background-color','white')) %>%
+  add_css_table(css=list('font-size','20')) %>%
+  add_css_column(css=list('color','white'),columns=c(0))%>%
+  add_css_header(css=list(c('color','background-color'),c('white','white')),headers=c(1:3))
+              
+```
+
+
+###  Vacancy Rate by Town
+```{r}
+
+#loading libraries now, because of dependent conflicts that occurred when loaded earlier.
+library(rgdal)
+library(sp)
+library(leaflet)
+library(tigris)
+
+# note that you can use county names in the tigris package but 
+# not in the acs.fetch function from the acs package so I'm using
+# fips numbers here to properly match the tables from CensusDB SQLite
+
+# grab the spatial data (tigris) and create a spatial dataframe using the tigris package
+# This code knits fine on my PC, but because of either browser settings or OS, it will not knit properly (although it does run fine when just the code is run)
+subdivs <- county_subdivisions(state = 'MA', county = c(1,3,5,7,9, 11, 13, 15, 17, 19, 21,23, 25,27), cb=TRUE)
+
+#SQL statement to pull the vacancy information and total unit information
+sql7 <- paste0("SELECT Community.GEO_ID as 'GEOID', Community.Community, HousingUnits.Total as 'Units', Vacancy.Total as 'Vacancy'
+        FROM Community LEFT JOIN Vacancy on Community.GEO_ID = Vacancy.GEO_ID
+                      LEFT JOIN HousingUnits on Community.GEO_ID = HousingUnits.GEO_ID")
+
+#retrieving from SQLite
+q7 <-
+dbGetQuery(db,sql7)
+
+#creating a rate field and then cutting dataframe to show 1 record for each community/geoID:
+q7<- q7 %>% distinct() %>% 
+            mutate(VacancyRate = Vacancy/Units) %>%
+            select(GEOID,Community,VacancyRate)
+
+#Link the datatable to the spatial data frame based on GEOID
+vacancy_merged<- geo_join(subdivs, q7, "GEOID", "GEOID")
+
+#Create the pop up parameters for the interactive map
+popup <- paste0("Community: ", vacancy_merged$Community, "<br>", "Vacancy Rate: ", round(vacancy_merged$VacancyRate,2))
+
+#Designate color palette with ColorBrewer
+pal <- colorNumeric(
+  palette = "YlGnBu",
+  domain = vacancy_merged$VacancyRate
+)
+
+#create map with leaflet using data from the spatial data frame
+map3<-leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = vacancy_merged, 
+              fillColor = ~pal(VacancyRate), 
+              color = "#b2aeae",
+              fillOpacity = 0.7, 
+              weight = 1, 
+              smoothFactor = 0.2,
+              popup = popup) %>%
+  addLegend(pal = pal, 
+            values = vacancy_merged$VacancyRate, 
+            position = "topright", 
+            title = "",
+            labFormat = labelFormat(suffix = "%")) 
+map3
+```
+
+
+

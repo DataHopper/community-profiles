@@ -1,0 +1,394 @@
+---
+title: "ACSDataScrapeTidyStore"
+author: "Tom Hopper"
+date: "July 19, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(root.dir = '~/')
+```
+
+```{r message=FALSE}
+#prep
+library(rgdal)
+library(sp)
+library(tidyverse)
+library(leaflet)
+library(ggplot2)
+library(tigris)
+library(acs)
+library(stringr) # to pad fips codes
+library(RSQLite)
+
+#creating database
+CensusDB <- dbConnect(SQLite(), dbname="CensusDB.sqlite")
+```
+
+
+```{r}
+api.key.install(key="c62dd5a0676e00fa594a8a7bbfefc4cc0d96d20e")
+
+# create a geographic set to grab tabular data (acs)
+geo<-geo.make(state=c("MA"),county="*",
+              county.subdivision="*")
+
+#List of tables to download, reformat and store:
+#B01001	Sex by Age
+#B01002 Median Age by Sex
+#B02001 Race
+#B25024	Units in Structure
+#B25008	Total Population in Occupied Housing Units by Tenure
+#B25092	Median Selected Monthly Owner Costs as a Percentage of Household Income in the Past 12 #Months
+#B25070	Gross Rent as a Percentage of Household Income in the Past 12 Months
+#B25004	Vacancy Status
+#B25077 Median Value (Dollars)
+```
+
+
+B25077 Median Value (Dollars)
+```{r}
+#Fetch data via Census API using acs package
+MedianValue<-acs.fetch(endyear = 2015, span = 5, geography = geo,
+                table.number = "B25077", case.sensitive=F, col.names="pretty")
+
+#data downloads as acs-class, which is an array-type format. Need to do some digging across that array to create a flat dataframe for storage. First, viewing the attributes of the acs-class:
+names(attributes(MedianValue))
+
+#Now looking into the names of the fields within the 'acs.colnames' and 'geography', since this is how I will reference the data I need to pull into a data frame
+MedianValue@acs.colnames
+MedianValue@geography
+
+#I want to create a geographic identifier for each town that is a combination of the fips codes for the state, county, and county subdivision. Both because I want a simpler key to join tables on, but also because I know I will want to be able to connect these tables to census shapefiles for mapping purposes. The Census shapefiles use a single field for GEOID that is a composite of the fips ids for the locations.
+
+#In order to get the GEO_ID field in the right format, I need to pad the fips codes with zeros to ensure proper formatting with the correct number of digits.
+#Community name is being slimmed down to only include the town name
+#Adding a year field so that if additional periods of census data are added at a later date, there is a way to distinguish the data across sets
+#Finally, adding the value of the one field I want for Median Value
+MedianValue_df <- data.frame(GEO_ID = paste0(str_pad(MedianValue@geography$state, 2, "left", pad="0"), 
+                             str_pad(MedianValue@geography$county, 3, "left", pad="0"), 
+                             str_pad(MedianValue@geography$countysubdivision, 5, "left", pad="0")),
+  Community = str_replace_all(str_extract(MedianValue@geography$NAME,"^(.*?),"),"( town,| Town| city,|,)",""),
+  Year = '2011-2015',
+  MedianValue = as.numeric(MedianValue@estimate[,c("Median Value (Dollars) for Owner-Occupied Housing Units: Median value (dollars)")])
+)
+
+#Because Massachusetts has no unincorporated land, I am removing the undefined county subdivision amounts because they are all zero.
+MedianValue_df <- MedianValue_df %>%
+  filter(Community !="County subdivisions not defined")
+
+#Writing the data to SQLite
+dbWriteTable(CensusDB, "MedianValue",MedianValue_df,overwrite=TRUE)
+
+
+#I also need to create a table of just GEO_ID and Community. Many of the tables to be created in this document will have multiple records for each community. This will allow me to have a reference table with a primary key consisting of the GEO_ID and Town Name.
+Communities <- data.frame(GEO_ID = paste0(str_pad(MedianValue@geography$state, 2, "left", pad="0"), str_pad(MedianValue@geography$county, 3, "left", pad="0"), str_pad(MedianValue@geography$countysubdivision, 5, "left", pad="0")),  
+    Community = str_replace_all(str_extract(MedianValue@geography$NAME,"^(.*?),"),"( town,| Town| city,|,)",""))
+
+#Again, filtering out the NULL values for unincorporated areas 
+Communities <- Communities %>%
+  filter(Community !="County subdivisions not defined")
+
+#Writing the community reference table to SQLite
+dbWriteTable(CensusDB, "Community",Communities,overwrite=TRUE)
+```
+
+
+B25004: Vacancy Status and B25001: Housing Units
+```{r}
+#Each of the following chunks will download and store a census table using the same methods noted in the above chunk. These notes will not be repeated across all of the chunks. 
+
+Vacancy<-acs.fetch(endyear = 2015, span = 5, geography = geo,
+                table.number = "B25004", case.sensitive=F, col.names="pretty")
+names(attributes(Vacancy))
+Vacancy@acs.colnames <- str_replace_all(Vacancy@acs.colnames,"Vacancy Status: ","")
+attr(Vacancy,"acs.colnames")
+
+Vacancy_df <- data.frame(GEO_ID = paste0(str_pad(Vacancy@geography$state, 2, "left", pad="0"), 
+                             str_pad(Vacancy@geography$county, 3, "left", pad="0"), 
+                             str_pad(Vacancy@geography$countysubdivision, 5, "left", pad="0")),
+  Community = str_replace_all(str_extract(Vacancy@geography$NAME,"^(.*?),"),"( town,| Town| city,|,)",""),
+  Year = '2011-2015',
+  Total = as.numeric(Vacancy@estimate[,c("Vacancy Status: Total:")]),
+  ForRent = as.numeric(Vacancy@estimate[,c("Vacancy Status: For rent")]), 
+  RentedNotOcc = as.numeric(Vacancy@estimate[,c("Vacancy Status: Rented, not occupied")]),
+  ForSale = as.numeric(Vacancy@estimate[,c("Vacancy Status: For sale only")]),
+  SoldNotOcc = as.numeric(Vacancy@estimate[,c("Vacancy Status: Sold, not occupied")]),
+  SeasonalRec = as.numeric(Vacancy@estimate[,c("Vacancy Status: For seasonal, recreational, or occasional use")]),
+  ForMigrantWorkers = as.numeric(Vacancy@estimate[,c("Vacancy Status: For migrant workers")]),
+  OtherVacant = as.numeric(Vacancy@estimate[,c("Vacancy Status: Other vacant")])
+)
+
+Vacancy_df <- Vacancy_df %>%
+  gather(VacancyType,Count,ForRent:OtherVacant) %>%
+  filter(Community !="County subdivisions not defined") %>%
+  mutate(Share = Count/Total)
+
+dbWriteTable(CensusDB, "Vacancy",Vacancy_df,overwrite=TRUE)
+```
+
+
+B25070	Gross Rent as a Percentage of Household Income in the Past 12 Months
+```{r}
+RentBurden<-acs.fetch(endyear = 2015, span = 5, geography = geo,
+                table.number = "B25070", case.sensitive=F, col.names="pretty")
+
+RentBurden_df <- data.frame(GEO_ID = paste0(str_pad(RentBurden@geography$state, 2, "left", pad="0"), 
+                             str_pad(RentBurden@geography$county, 3, "left", pad="0"), 
+                             str_pad(RentBurden@geography$countysubdivision, 5, "left", pad="0")),
+  Community = str_replace_all(str_extract(RentBurden@geography$NAME,"^(.*?),"),"( town,| Town| city,|,)",""),
+  Year = '2011-2015',
+  Total = as.numeric(RentBurden@estimate[,c("Gross Rent as a Percentage of Household Income: Total:")]),
+  Percent_LessThan10 = as.numeric(RentBurden@estimate[,c("Gross Rent as a Percentage of Household Income: Less than 10.0 percent")]), 
+  Percent_10.0to14.9 = as.numeric(RentBurden@estimate[,c("Gross Rent as a Percentage of Household Income: 10.0 to 14.9 percent")]),
+  Percent_15.0to19.9 = as.numeric(RentBurden@estimate[,c("Gross Rent as a Percentage of Household Income: 15.0 to 19.9 percent")]),
+  Percent_20.0to24.9 = as.numeric(RentBurden@estimate[,c("Gross Rent as a Percentage of Household Income: 20.0 to 24.9 percent")]),
+  Percent_25.0to29.9 = as.numeric(RentBurden@estimate[,c("Gross Rent as a Percentage of Household Income: 25.0 to 29.9 percent")]),
+  Percent_30.0to34.9 = as.numeric(RentBurden@estimate[,c("Gross Rent as a Percentage of Household Income: 30.0 to 34.9 percent")]),
+  Percent_35.0to39.9 = as.numeric(RentBurden@estimate[,c("Gross Rent as a Percentage of Household Income: 35.0 to 39.9 percent")]),
+  Percent_40.0to49.9 = as.numeric(RentBurden@estimate[,c("Gross Rent as a Percentage of Household Income: 40.0 to 49.9 percent")]),
+  Percent_50.0ormore = as.numeric(RentBurden@estimate[,c("Gross Rent as a Percentage of Household Income: 50.0 percent or more")]),
+  NotComputed =as.numeric(RentBurden@estimate[,c("Gross Rent as a Percentage of Household Income: Not computed")])
+)
+
+RentBurden_df <- RentBurden_df %>%
+  gather(Tranch,Count,Percent_LessThan10:NotComputed) %>%
+  filter(Community !="County subdivisions not defined") %>%
+  mutate(Share = Count/Total)
+
+dbWriteTable(CensusDB, "RentBurden",RentBurden_df,overwrite=TRUE)
+```
+
+B25095	HOUSEHOLD INCOME BY SELECTED MONTHLY OWNER COSTS AS A PERCENTAGE OF HOUSEHOLD INCOME IN THE PAST 12 MONTHS
+```{r}
+CostBurden<-acs.fetch(endyear = 2015, span = 5, geography = geo,
+                table.number = "B25095", case.sensitive=F, col.names="pretty")
+names(attributes(CostBurden))
+attr(CostBurden, "acs.colnames")
+
+CostBurden_df <- data.frame(GEO_ID = paste0(str_pad(CostBurden@geography$state, 2, "left", pad="0"), 
+                             str_pad(CostBurden@geography$county, 3, "left", pad="0"), 
+                             str_pad(CostBurden@geography$countysubdivision, 5, "left", pad="0")),
+  Community = str_replace_all(str_extract(CostBurden@geography$NAME,"^(.*?),"),"( town,| Town| city,|,)",""),
+  Year = '2011-2015',
+  Total = as.numeric(CostBurden@estimate[,1]),
+  Percent_LessThan20 = as.numeric(CostBurden@estimate[,3])+
+    as.numeric(CostBurden@estimate[,12])+
+    as.numeric(CostBurden@estimate[,21])+
+    as.numeric(CostBurden@estimate[,30])+
+    as.numeric(CostBurden@estimate[,39])+
+    as.numeric(CostBurden@estimate[,48])+
+    as.numeric(CostBurden@estimate[,57])+
+    as.numeric(CostBurden@estimate[,66]),
+  Percent_20to24.9 = as.numeric(CostBurden@estimate[,4])+
+    as.numeric(CostBurden@estimate[,13])+
+    as.numeric(CostBurden@estimate[,22])+
+    as.numeric(CostBurden@estimate[,31])+
+    as.numeric(CostBurden@estimate[,40])+
+    as.numeric(CostBurden@estimate[,49])+
+    as.numeric(CostBurden@estimate[,58])+
+    as.numeric(CostBurden@estimate[,67]),
+  Percent_25to29.9 = as.numeric(CostBurden@estimate[,5])+
+    as.numeric(CostBurden@estimate[,14])+
+    as.numeric(CostBurden@estimate[,23])+
+    as.numeric(CostBurden@estimate[,32])+
+    as.numeric(CostBurden@estimate[,41])+
+    as.numeric(CostBurden@estimate[,50])+
+    as.numeric(CostBurden@estimate[,59])+
+    as.numeric(CostBurden@estimate[,68]),
+  Percent_30to34.9 = as.numeric(CostBurden@estimate[,6])+
+    as.numeric(CostBurden@estimate[,15])+
+    as.numeric(CostBurden@estimate[,24])+
+    as.numeric(CostBurden@estimate[,33])+
+    as.numeric(CostBurden@estimate[,42])+
+    as.numeric(CostBurden@estimate[,51])+
+    as.numeric(CostBurden@estimate[,60])+
+    as.numeric(CostBurden@estimate[,69]),
+  Percent_35to29.9 = as.numeric(CostBurden@estimate[,7])+
+    as.numeric(CostBurden@estimate[,16])+
+    as.numeric(CostBurden@estimate[,25])+
+    as.numeric(CostBurden@estimate[,34])+
+    as.numeric(CostBurden@estimate[,43])+
+    as.numeric(CostBurden@estimate[,52])+
+    as.numeric(CostBurden@estimate[,61])+
+    as.numeric(CostBurden@estimate[,70]),
+  Percent_40to49.9 = as.numeric(CostBurden@estimate[,8])+
+    as.numeric(CostBurden@estimate[,17])+
+    as.numeric(CostBurden@estimate[,26])+
+    as.numeric(CostBurden@estimate[,35])+
+    as.numeric(CostBurden@estimate[,44])+
+    as.numeric(CostBurden@estimate[,53])+
+    as.numeric(CostBurden@estimate[,62])+
+    as.numeric(CostBurden@estimate[,71]),
+  Percent_50Plus = as.numeric(CostBurden@estimate[,9])+
+    as.numeric(CostBurden@estimate[,18])+
+    as.numeric(CostBurden@estimate[,27])+
+    as.numeric(CostBurden@estimate[,36])+
+    as.numeric(CostBurden@estimate[,45])+
+    as.numeric(CostBurden@estimate[,54])+
+    as.numeric(CostBurden@estimate[,63])+
+    as.numeric(CostBurden@estimate[,72]),
+  Percent_NotComputed = as.numeric(CostBurden@estimate[,10])+
+    as.numeric(CostBurden@estimate[,19])+
+    as.numeric(CostBurden@estimate[,28])+
+    as.numeric(CostBurden@estimate[,37])+
+    as.numeric(CostBurden@estimate[,46])+
+    as.numeric(CostBurden@estimate[,55])+
+    as.numeric(CostBurden@estimate[,64])+
+    as.numeric(CostBurden@estimate[,73])
+)
+
+CostBurden_df <- CostBurden_df %>%
+  gather(BurdenLevel,Count,Percent_LessThan20:Percent_NotComputed) %>%
+  filter(Community !="County subdivisions not defined")
+
+dbWriteTable(CensusDB, "OwnerBurden",CostBurden_df,overwrite=TRUE)
+```
+
+B25008	Total Population in Occupied Housing Units by Tenure
+```{r}
+Tenure<-acs.fetch(endyear = 2015, span = 5, geography = geo,
+                table.number = "B25008", case.sensitive=F, col.names="pretty")
+names(attributes(Tenure))
+attr(Tenure, "acs.colnames")
+
+Tenure_df <- data.frame(GEO_ID = paste0(str_pad(Tenure@geography$state, 2, "left", pad="0"), 
+                             str_pad(Tenure@geography$county, 3, "left", pad="0"), 
+                             str_pad(Tenure@geography$countysubdivision, 5, "left", pad="0")),
+  Community = str_replace_all(str_extract(Tenure@geography$NAME,"^(.*?),"),"( town,| Town| city,|,)",""),
+  Year = '2011-2015',
+  Total = as.numeric(Tenure@estimate[,c("Total Population in Occupied Housing Units by Tenure: Total:")]),
+  Owner = as.numeric(Tenure@estimate[,c("Total Population in Occupied Housing Units by Tenure: Owner occupied")]),
+  Renter = as.numeric(Tenure@estimate[,c("Total Population in Occupied Housing Units by Tenure: Renter occupied")])
+)
+
+Tenure_df <- Tenure_df %>%
+  gather(Tenure,Count,Owner:Renter) %>%
+  filter(Community !="County subdivisions not defined") %>%
+  mutate(Share=Count/Total)
+
+dbWriteTable(CensusDB, "Tenure",Tenure_df,overwrite=TRUE)
+```
+
+B02001: Race
+```{r}
+#Pulling tables related to race
+Race<-acs.fetch(endyear = 2015, span = 5, geography = geo,
+                table.number = "B02001", case.sensitive=F, col.names="pretty")
+names(attributes(Race))
+attr(Race, "acs.colnames")
+Race_df <- data.frame(GEO_ID = paste0(str_pad(Race@geography$state, 2, "left", pad="0"), 
+                             str_pad(Race@geography$county, 3, "left", pad="0"), 
+                             str_pad(Race@geography$countysubdivision, 5, "left", pad="0")),
+                      Community = str_replace_all(str_extract(Race@geography$NAME,"^(.*?),"),"( town,| Town| city,|,)",""),
+                      Year = '2011-2015',
+                             White = as.numeric(Race@estimate[,c("Race: White alone")]),
+                      Black = as.numeric(Race@estimate[,c("Race: Black or African American alone")]),
+                      NativeAmerican = as.numeric(Race@estimate[,c("Race: American Indian and Alaska Native alone")]),
+                      Asian = as.numeric(Race@estimate[,c("Race: Asian alone")]),
+                      PacificIslander = as.numeric(Race@estimate[,c("Race: Native Hawaiian and Other Pacific Islander alone")]),
+                      Other = as.numeric(Race@estimate[,c("Race: Some other race alone")]),
+                      TwoPlusRaces = as.numeric((Race@estimate[,c("Race: Two or more races:")]))+
+                      as.numeric((Race@estimate[,c("Race: Two or more races: Two races including Some other race")]))+
+                      as.numeric((Race@estimate[,c("Race: Two or more races: Two races excluding Some other race, and three or more races")]))
+)
+
+
+Race_df <- Race_df %>%
+  gather(Race,Count,White:TwoPlusRaces) %>%
+  filter(Community !="County subdivisions not defined")
+
+dbWriteTable(CensusDB, "Race",Race_df,overwrite=TRUE)
+```
+
+B01001: Sex by Age and B01002: Median Age by Sex
+```{r}
+#Pulling tables related to age demographics
+demogs<-acs.fetch(endyear = 2015, span = 5, geography = geo,
+                table.number = "B01001", case.sensitive=F, col.names="pretty")
+
+medianage<-acs.fetch(endyear = 2015, span = 5, geography = geo,
+                table.number = "B01002", case.sensitive=F, col.names="pretty")
+
+#tidying median age by community
+medianage_df <- data.frame(GEO_ID = paste0(str_pad(medianage@geography$state, 2, "left", pad="0"), 
+                             str_pad(medianage@geography$county, 3, "left", pad="0"), 
+                             str_pad(medianage@geography$countysubdivision, 5, "left", pad="0")),
+                             MedianAge = as.numeric(medianage@estimate[,c("Median Age by Sex: Median age -- Total:")])
+)
+
+#tidying age cohort information
+#padding geography/fips ID information fo easy joining to spatial layers later
+#consolidating columns and rows into equal age cohorts (5 year cohorts) and combining information for male and female populations
+demogs_df <- data.frame(GEO_ID = paste0(str_pad(demogs@geography$state, 2, "left", pad="0"), 
+            str_pad(demogs@geography$county, 3, "left", pad="0"), 
+            str_pad(demogs@geography$countysubdivision, 5, "left", pad="0")),
+  Community = str_replace_all(str_extract(demogs@geography$NAME,"^(.*?),"),"( town,| Town| city,|,)",""),
+  Year = '2011-2015',
+  Total=as.numeric(demogs@estimate[,c("Sex by Age: Total:")]),
+  Under5 = as.numeric(demogs@estimate[,c("Sex by Age: Male: Under 5 years")]+demogs@estimate[,c("Sex by Age: Female: Under 5 years")]),
+  x05to9 = as.numeric(demogs@estimate[,c("Sex by Age: Male: 5 to 9 years")]+demogs@estimate[,c("Sex by Age: Female: 5 to 9 years")]),
+  x10to14 = as.numeric(demogs@estimate[,c("Sex by Age: Male: 10 to 14 years")]+demogs@estimate[,c("Sex by Age: Female: 10 to 14 years")]),
+  x15to19 = as.numeric(demogs@estimate[,c("Sex by Age: Male: 15 to 17 years")]+demogs@estimate[,c("Sex by Age: Female: 15 to 17 years")]+demogs@estimate[,c("Sex by Age: Male: 18 and 19 years")]+demogs@estimate[,c("Sex by Age: Female: 18 and 19 years")]),
+  x20to24 = as.numeric(demogs@estimate[,c("Sex by Age: Male: 20 years")]+demogs@estimate[,c("Sex by Age: Female: 20 years")]+demogs@estimate[,c("Sex by Age: Male: 21 years")]+demogs@estimate[,c("Sex by Age: Female: 21 years")]+demogs@estimate[,c("Sex by Age: Male: 22 to 24 years")]+demogs@estimate[,c("Sex by Age: Female: 22 to 24 years")]),
+  x25to29 = as.numeric(demogs@estimate[,c("Sex by Age: Male: 25 to 29 years")]+demogs@estimate[,c("Sex by Age: Female: 25 to 29 years")]),
+  x30to34 = as.numeric(demogs@estimate[,c("Sex by Age: Male: 30 to 34 years")]+demogs@estimate[,c("Sex by Age: Female: 30 to 34 years")]),
+  x35to39 = as.numeric(demogs@estimate[,c("Sex by Age: Male: 35 to 39 years")]+demogs@estimate[,c("Sex by Age: Female: 35 to 39 years")]),
+  x40to44 = as.numeric(demogs@estimate[,c("Sex by Age: Male: 40 to 44 years")]+demogs@estimate[,c("Sex by Age: Female: 40 to 44 years")]),
+  x45to49 = as.numeric(demogs@estimate[,c("Sex by Age: Male: 45 to 49 years")]+demogs@estimate[,c("Sex by Age: Female: 45 to 49 years")]),
+  x50to54 = as.numeric(demogs@estimate[,c("Sex by Age: Male: 50 to 54 years")]+demogs@estimate[,c("Sex by Age: Female: 50 to 54 years")]),
+  x55to59 = as.numeric(demogs@estimate[,c("Sex by Age: Male: 55 to 59 years")]+demogs@estimate[,c("Sex by Age: Female: 55 to 59 years")]),
+  x60to64 = as.numeric(demogs@estimate[,c("Sex by Age: Male: 60 and 61 years")]+demogs@estimate[,c("Sex by Age: Female: 60 and 61 years")]+demogs@estimate[,c("Sex by Age: Male: 62 to 64 years")]+demogs@estimate[,c("Sex by Age: Female: 62 to 64 years")]),
+  x65to69 = as.numeric(demogs@estimate[,c("Sex by Age: Male: 65 and 66 years")]+demogs@estimate[,c("Sex by Age: Female: 65 and 66 years")]+demogs@estimate[,c("Sex by Age: Male: 67 to 69 years")]+demogs@estimate[,c("Sex by Age: Female: 67 to 69 years")]),
+  x70to74 = as.numeric(demogs@estimate[,c("Sex by Age: Male: 70 to 74 years")]+demogs@estimate[,c("Sex by Age: Female: 70 to 74 years")]),
+  x75to79 = as.numeric(demogs@estimate[,c("Sex by Age: Male: 75 to 79 years")]+demogs@estimate[,c("Sex by Age: Female: 75 to 79 years")]),
+  x80to84 = as.numeric(demogs@estimate[,c("Sex by Age: Male: 80 to 84 years")]+demogs@estimate[,c("Sex by Age: Female: 80 to 84 years")]),
+  x85Plus = as.numeric(demogs@estimate[,c("Sex by Age: Male: 85 years and over")]+demogs@estimate[,c("Sex by Age: Female: 85 years and over")])
+)
+
+#gathering for tidy data
+#removing the rows that have totals on the county level
+#creating a proportion column that indicates what proportion of the population each cohort comprises
+demogs_df <- demogs_df %>%
+  gather(AgeGroup,Count,Under5:x85Plus) %>%
+  filter(Community !="County subdivisions not defined") %>%
+  mutate(Share=as.numeric(Count)/as.numeric(Total))
+
+dbWriteTable(CensusDB, "AgeDemogs",demogs_df,overwrite=TRUE)
+```
+
+B25024: Units in Structure
+```{r}
+HousingUnits<-acs.fetch(endyear = 2015, span = 5, geography = geo,
+                table.number = "B25024", case.sensitive=F, col.names="pretty")
+names(attributes(HousingUnits))
+attr(HousingUnits, "acs.colnames")
+
+HousingUnits_df <- data.frame(GEO_ID = paste0(str_pad(HousingUnits@geography$state, 2, "left", pad="0"), 
+                             str_pad(HousingUnits@geography$county, 3, "left", pad="0"), 
+                             str_pad(HousingUnits@geography$countysubdivision, 5, "left", pad="0")),
+                      Community = str_replace_all(str_extract(HousingUnits@geography$NAME,"^(.*?),"),"( town,| Town| city,|,)",""),
+                      Year = '2011-2015',
+                      
+                      Total = as.numeric(HousingUnits@estimate[,c("Units in Structure: Total:")]),
+                      SF_detached = as.numeric(HousingUnits@estimate[,c("Units in Structure: 1, detached")]),
+                      SF_attached = as.numeric(HousingUnits@estimate[,c("Units in Structure: 1, attached")]),
+                      Two_Fam = as.numeric(HousingUnits@estimate[,c("Units in Structure: 2")]),
+                      Three_Four_Fam = as.numeric(HousingUnits@estimate[,c("Units in Structure: 3 or 4")]),
+                      Five_Nine_Unit = as.numeric(HousingUnits@estimate[,c("Units in Structure: 5 to 9")]),
+                      Ten_Nineteen_Unit = as.numeric((HousingUnits@estimate[,c("Units in Structure: 10 to 19")])),
+                      Twenty_FortyNine_Units= as.numeric((HousingUnits@estimate[,c("Units in Structure: 20 to 49")])),
+                      Fifty_Plus_Units= as.numeric((HousingUnits@estimate[,c("Units in Structure: 50 or more")])),
+                      Mobile_Home= as.numeric((HousingUnits@estimate[,c("Units in Structure: Mobile home")])),
+                      Boat_RV_van_etc= as.numeric((HousingUnits@estimate[,c("Units in Structure: Boat, RV, van, etc.")]))
+)
+
+HousingUnits_df <- HousingUnits_df %>%
+  gather(Building_Type,Count,SF_detached:Boat_RV_van_etc) %>%
+  filter(Community !="County subdivisions not defined")
+
+dbWriteTable(CensusDB, "HousingUnits",HousingUnits_df,overwrite=TRUE)
+```
+
+
